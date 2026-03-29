@@ -48,6 +48,29 @@ func main() {
 
 The `keys` and `values` slices must have equal length, and keys must be unique. After construction, the `ConstMap` is immutable. Looking up a key that was not in the original set returns an undefined value.
 
+## Serialization
+
+A `ConstMap` can be serialized to disk and loaded back later, avoiding the cost of reconstruction. The binary format includes a FNV-1a checksum to detect corruption.
+
+```go
+// Save to file.
+err := cm.SaveToFile("mymap.cmap")
+
+// Load from file.
+cm, err := constmap.LoadFromFile("mymap.cmap")
+```
+
+For streaming use, `WriteTo` and `ReadFrom` work with any `io.Writer` / `io.Reader`:
+
+```go
+// Write to any io.Writer.
+n, err := cm.WriteTo(w)
+
+// Read from any io.Reader.
+var cm constmap.ConstMap
+n, err := cm.ReadFrom(r)
+```
+
 ## Running Tests
 
 ```

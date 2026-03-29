@@ -104,18 +104,6 @@ func BenchmarkGoMap(b *testing.B) {
 	}
 }
 
-func BenchmarkConstMapNew(b *testing.B) {
-	keys, values := makeBenchData(benchN)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := New(keys, values)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func TestMemoryUsage(t *testing.T) {
 	n := benchN
 	keys, values := makeBenchData(n)
