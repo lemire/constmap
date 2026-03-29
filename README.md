@@ -77,6 +77,15 @@ n, err := cm.ReadFrom(r)
 go test -v
 ```
 
+## Performance gains
+
+The construction time is higher (as expected for any compact data structure), but lookups are optimized for speed. I ran benchmarks on my Apple M4 Max processor to compare constmap lookups against Go's built-in `map[string]uint64`. The test uses 1 million keys.
+
+| Data Structure | Lookup Time | Memory Usage |
+|----------------|-------------|--------------|
+| ConstMap       | 7.4 ns/op |  9 bytes/key   |
+| Go Map         | 20 ns/op | 56 bytes/key    |
+
 ## Benchmarks
 
 The benchmark suite compares `ConstMap` against Go's built-in `map[string]uint64` using 1,000,000 keys. To run:
