@@ -78,6 +78,32 @@ func makeBenchData(n int) ([]string, []uint64) {
 	return keys, values
 }
 
+func BenchmarkNew(b *testing.B) {
+	for _, n := range []int{1 << 18, 1 << 20, 1 << 24} {
+		b.Run(fmt.Sprintf("%d", n), func(b *testing.B) {
+			keys, values := makeBenchData(n)
+			for b.Loop() {
+				if _, err := New(keys, values); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkNewVerified(b *testing.B) {
+	for _, n := range []int{1 << 18, 1 << 20, 1 << 24} {
+		b.Run(fmt.Sprintf("%d", n), func(b *testing.B) {
+			keys, values := makeBenchData(n)
+			for b.Loop() {
+				if _, err := NewVerified(keys, values); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkConstMap(b *testing.B) {
 	keys, values := makeBenchData(benchN)
 	cm, err := New(keys, values)
