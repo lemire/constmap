@@ -3,7 +3,7 @@ package constmap
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -69,11 +69,18 @@ func TestMismatchedLengths(t *testing.T) {
 const benchN = 1_000_000
 
 func makeBenchData(n int) ([]string, []uint64) {
-	keys := make([]string, n)
-	values := make([]uint64, n)
-	for i := 0; i < n; i++ {
+	var N uint64 = uint64(n)
+	keys := make([]string, N)
+	values := make([]uint64, N)
+	var i uint64
+	for i = 0; i < N; i++ {
 		keys[i] = fmt.Sprintf("key-%d", i)
 		values[i] = uint64(i)
+	}
+	rng := mathrand.NewPCG(0xdead, 0xbeef)
+	for i = N - 1; i > 0; i-- {
+		j := rng.Uint64() % (i + 1)
+		keys[i], keys[j] = keys[j], keys[i]
 	}
 	return keys, values
 }
@@ -174,12 +181,12 @@ func TestMemoryUsage(t *testing.T) {
 }
 
 func TestRandomValues(t *testing.T) {
-	rng := rand.New(rand.NewSource(42))
+	rng := mathrand.New(mathrand.NewPCG(42, 24))
 	n := 50000
 	keys := make([]string, n)
 	values := make([]uint64, n)
 	for i := 0; i < n; i++ {
-		keys[i] = fmt.Sprintf("random-key-%d-%d", i, rng.Int63())
+		keys[i] = fmt.Sprintf("random-key-%d-%d", i, rng.Int64())
 		values[i] = rng.Uint64()
 	}
 
