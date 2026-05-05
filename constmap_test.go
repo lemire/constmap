@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestBasic(t *testing.T) {
@@ -116,6 +117,86 @@ func BenchmarkGoMap(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = m[keys[i%benchN]]
 	}
+}
+
+const (
+	floatBenchN    = 100_000
+	floatArrayLen  = 8
+)
+
+var floatSink float32
+
+func makeFloatArrayBenchData(n int) ([]string, [][]float32) {
+	keys := make([]string, n)
+	vals := make([][]float32, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Sprintf("key-%d", i)
+		arr := make([]float32, floatArrayLen)
+		for j := 0; j < floatArrayLen; j++ {
+			arr[j] = float32(i*floatArrayLen + j)
+		}
+		vals[i] = arr
+	}
+	return keys, vals
+}
+
+// Standard map[string][]float32 lookup.
+func BenchmarkGoMapFloatArray(b *testing.B) {
+	keys, vals := makeFloatArrayBenchData(floatBenchN)
+	m := make(map[string][]float32, floatBenchN)
+	for i, k := range keys {
+		m[k] = vals[i]
+	}
+
+	b.ResetTimer()
+	var s float32
+	for i := 0; i < b.N; i++ {
+		s += m[keys[i%floatBenchN]][0]
+	}
+	floatSink = s
+}
+
+// ConstMap returns an index into a [][]float32.
+func BenchmarkConstMapFloatArrayIndex(b *testing.B) {
+	keys, vals := makeFloatArrayBenchData(floatBenchN)
+	indices := make([]uint64, floatBenchN)
+	for i := range keys {
+		indices[i] = uint64(i)
+	}
+	cm, err := New(keys, indices)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	var s float32
+	for i := 0; i < b.N; i++ {
+		s += vals[cm.Map(keys[i%floatBenchN])][0]
+	}
+	floatSink = s
+}
+
+// ConstMap returns a pointer (encoded as uint64) directly to the float array,
+// skipping the indirection through a [][]float32.
+func BenchmarkConstMapFloatArrayPointer(b *testing.B) {
+	keys, vals := makeFloatArrayBenchData(floatBenchN)
+	pointers := make([]uint64, floatBenchN)
+	for i := range keys {
+		pointers[i] = uint64(uintptr(unsafe.Pointer(&vals[i][0])))
+	}
+	cm, err := New(keys, pointers)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	var s float32
+	for i := 0; i < b.N; i++ {
+		ptr := cm.Map(keys[i%floatBenchN])
+		s += (*(**[floatArrayLen]float32)(unsafe.Pointer(&ptr)))[0]
+	}
+	floatSink = s
+	runtime.KeepAlive(vals)
 }
 
 func TestMemoryUsage(t *testing.T) {
