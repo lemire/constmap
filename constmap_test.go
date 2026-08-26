@@ -573,3 +573,34 @@ func TestLookupAndMemoryTable(t *testing.T) {
 		t.Logf("| Go Map            | %.1f ns/op  | %.1f bytes/key |", goMapNs, float64(goMapBytes)/float64(n))
 	}
 }
+
+func TestMapBatchCorrectness(t *testing.T) {
+	sizes := []int{0, 1, 5, 23, 24, 25, 47, 48, 49, 1000, 100_000}
+	for _, n := range sizes {
+		keys, values := makeBenchData(n)
+		cm, err := New(keys, values)
+		if err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		out := make([]uint64, n)
+		cm.MapBatch(keys, out)
+		for i, k := range keys {
+			want := cm.Map(k)
+			if out[i] != want {
+				t.Errorf("n=%d: MapBatch(%q)[%d] = %d, want %d", n, k, i, out[i], want)
+			}
+			if out[i] != values[i] {
+				t.Errorf("n=%d: MapBatch(%q)[%d] = %d, want value %d", n, k, i, out[i], values[i])
+			}
+		}
+
+		out2 := make([]uint64, n)
+		cm.MapBatchParallel(keys, out2)
+		for i, k := range keys {
+			want := cm.Map(k)
+			if out2[i] != want {
+				t.Errorf("n=%d: MapBatchParallel(%q)[%d] = %d, want %d", n, k, i, out2[i], want)
+			}
+		}
+	}
+}
