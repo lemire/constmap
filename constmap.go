@@ -614,6 +614,12 @@ const (
 	headerSizeV1 = 28
 )
 
+// ioChunkWords is how many uint64s WriteTo and ReadFrom move per call to the
+// underlying reader or writer. Moving one word at a time costs a call per
+// word -- and, when the reader is a bare *os.File, a syscall per word, which
+// dominates everything else. 8192 words is 64 KiB.
+const ioChunkWords = 8192
+
 // WriteTo serializes the ConstMap to w in a portable binary format.
 // A FNV-1a checksum is appended for integrity verification.
 func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
@@ -659,11 +665,19 @@ func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
-	// Data.
-	for _, v := range cm.data {
-		binary.LittleEndian.PutUint64(buf[:], v)
-		if _, err := mw.Write(buf[:]); err != nil {
-			return 0, err
+	// Data, encoded and written a chunk at a time.
+	if len(cm.data) > 0 {
+		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
+		for i := 0; i < len(cm.data); {
+			n := min(len(cm.data)-i, ioChunkWords)
+			b := chunk[:n*8]
+			for j, v := range cm.data[i : i+n] {
+				binary.LittleEndian.PutUint64(b[j*8:], v)
+			}
+			if _, err := mw.Write(b); err != nil {
+				return 0, err
+			}
+			i += n
 		}
 	}
 
@@ -727,13 +741,21 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 		}
 	}
 
-	// Data.
+	// Data, read a chunk at a time and decoded in place.
 	cm.data = make([]uint64, dataLen)
-	for i := range cm.data {
-		if _, err := io.ReadFull(tr, buf[:]); err != nil {
-			return 0, fmt.Errorf("constmap: reading data[%d]: %w", i, err)
+	if len(cm.data) > 0 {
+		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
+		for i := 0; i < len(cm.data); {
+			n := min(len(cm.data)-i, ioChunkWords)
+			b := chunk[:n*8]
+			if _, err := io.ReadFull(tr, b); err != nil {
+				return 0, fmt.Errorf("constmap: reading data[%d:%d]: %w", i, i+n, err)
+			}
+			for j := range cm.data[i : i+n] {
+				cm.data[i+j] = binary.LittleEndian.Uint64(b[j*8:])
+			}
+			i += n
 		}
-		cm.data[i] = binary.LittleEndian.Uint64(buf[:])
 	}
 
 	// Checksum: read from r directly (not through tee).
