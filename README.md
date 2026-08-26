@@ -89,6 +89,25 @@ at a time. That matters most when the underlying writer or reader is an unbuffer
 There is no need to wrap the file in a `bufio.Reader` yourself; that only adds a second
 copy, and measures slightly slower than handing `ReadFrom` the file directly.
 
+`VerifiedConstMap` serializes the same way, into its own format:
+
+```go
+// Save to file.
+err := vm.SaveToFile("myverifiedmap.cmap")
+
+// Load from file.
+vm, err := constmap.LoadVerifiedFromFile("myverifiedmap.cmap")
+```
+
+The two formats carry different magic bytes, so handing a file of one kind to the
+other kind's reader is reported rather than silently misinterpreted.
+
+The verified format pads its header to 32 bytes so that both `uint64` arrays begin on
+a 64-bit boundary: `data` at offset 32, and `checks` at `32 + 8*len(data)`, which is a
+multiple of eight because the first array is a whole number of words. A reader that
+maps or otherwise aliases the file can treat either array as a `[]uint64` without a
+misaligned access.
+
 For streaming use, `WriteTo` and `ReadFrom` work with any `io.Writer` / `io.Reader`:
 
 ```go
@@ -135,6 +154,7 @@ The main benchmarks are:
 - **BenchmarkVerifiedConstMap** -- lookup throughput for `VerifiedConstMap.Map()`
 - **BenchmarkGoMap** -- lookup throughput for Go's built-in map
 - **BenchmarkSaveToFile** / **BenchmarkLoadFromFile** -- serialization throughput
+- **BenchmarkVerifiedSaveToFile** / **BenchmarkLoadVerifiedFromFile** -- the same for `VerifiedConstMap`
 
 For stable, reproducible results:
 
