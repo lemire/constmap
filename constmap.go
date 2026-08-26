@@ -587,15 +587,38 @@ func (vm *VerifiedConstMap) Map(key string) uint64 {
 }
 
 // Binary format (all little-endian):
-//   [8] magic "CMAP0001"
+//   [8] magic "CMAP0002"
 //   [8] seed
 //   [4] segmentLength
 //   [4] segmentCount
 //   [4] len(data)
+//   [4] zero padding
 //   [8*len(data)] data
 //   [8] FNV-1a 64-bit checksum of all preceding bytes
+//
+// The padding puts the data array at offset 32, an eight-byte aligned offset,
+// which is what lets OpenMapped alias it straight out of a memory mapping
+// instead of copying it. The earlier "CMAP0001" layout is identical minus the
+// padding; ReadFrom still accepts it, and OpenMapped falls back to a plain
+// read for it.
 
-var magicBytes = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '1'}
+var (
+	magicBytes   = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '2'}
+	magicBytesV1 = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '1'}
+)
+
+// headerSize is the number of bytes preceding the data array in the current
+// format; headerSizeV1 is the same for the unpadded "CMAP0001" layout.
+const (
+	headerSize   = 32
+	headerSizeV1 = 28
+)
+
+// ioChunkWords is how many uint64s WriteTo and ReadFrom move per call to the
+// underlying reader or writer. Moving one word at a time costs a call per
+// word -- and, when the reader is a bare *os.File, a syscall per word, which
+// dominates everything else. 8192 words is 64 KiB.
+const ioChunkWords = 8192
 
 // WriteTo serializes the ConstMap to w in a portable binary format.
 // A FNV-1a checksum is appended for integrity verification.
@@ -636,11 +659,25 @@ func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
-	// Data.
-	for _, v := range cm.data {
-		binary.LittleEndian.PutUint64(buf[:], v)
-		if _, err := mw.Write(buf[:]); err != nil {
-			return 0, err
+	// Padding, so that the data array begins at offset 32.
+	binary.LittleEndian.PutUint32(buf[:4], 0)
+	if _, err := mw.Write(buf[:4]); err != nil {
+		return 0, err
+	}
+
+	// Data, encoded and written a chunk at a time.
+	if len(cm.data) > 0 {
+		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
+		for i := 0; i < len(cm.data); {
+			n := min(len(cm.data)-i, ioChunkWords)
+			b := chunk[:n*8]
+			for j, v := range cm.data[i : i+n] {
+				binary.LittleEndian.PutUint64(b[j*8:], v)
+			}
+			if _, err := mw.Write(b); err != nil {
+				return 0, err
+			}
+			i += n
 		}
 	}
 
@@ -650,7 +687,7 @@ func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
-	written := int64(8 + 8 + 4 + 4 + 4 + 8*len(cm.data) + 8)
+	written := int64(headerSize + 8*len(cm.data) + 8)
 	return written, nil
 }
 
@@ -666,7 +703,8 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 	if _, err := io.ReadFull(tr, buf[:]); err != nil {
 		return 0, fmt.Errorf("constmap: reading magic: %w", err)
 	}
-	if buf != magicBytes {
+	padded := buf == magicBytes
+	if !padded && buf != magicBytesV1 {
 		return 0, errors.New("constmap: invalid magic bytes")
 	}
 
@@ -696,13 +734,28 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 	}
 	dataLen := binary.LittleEndian.Uint32(buf[:4])
 
-	// Data.
-	cm.data = make([]uint64, dataLen)
-	for i := range cm.data {
-		if _, err := io.ReadFull(tr, buf[:]); err != nil {
-			return 0, fmt.Errorf("constmap: reading data[%d]: %w", i, err)
+	// Padding (present only in "CMAP0002" and later).
+	if padded {
+		if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+			return 0, fmt.Errorf("constmap: reading padding: %w", err)
 		}
-		cm.data[i] = binary.LittleEndian.Uint64(buf[:])
+	}
+
+	// Data, read a chunk at a time and decoded in place.
+	cm.data = make([]uint64, dataLen)
+	if len(cm.data) > 0 {
+		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
+		for i := 0; i < len(cm.data); {
+			n := min(len(cm.data)-i, ioChunkWords)
+			b := chunk[:n*8]
+			if _, err := io.ReadFull(tr, b); err != nil {
+				return 0, fmt.Errorf("constmap: reading data[%d:%d]: %w", i, i+n, err)
+			}
+			for j := range cm.data[i : i+n] {
+				cm.data[i+j] = binary.LittleEndian.Uint64(b[j*8:])
+			}
+			i += n
+		}
 	}
 
 	// Checksum: read from r directly (not through tee).
@@ -715,7 +768,11 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 		return 0, fmt.Errorf("constmap: checksum mismatch (got %016x, expected %016x)", gotSum, expectedSum)
 	}
 
-	read := int64(8 + 8 + 4 + 4 + 4 + 8*int(dataLen) + 8)
+	header := headerSizeV1
+	if padded {
+		header = headerSize
+	}
+	read := int64(header + 8*int(dataLen) + 8)
 	return read, nil
 }
 
