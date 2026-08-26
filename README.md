@@ -76,9 +76,18 @@ err := cm.SaveToFile("mymap.cmap")
 cm, err := constmap.LoadFromFile("mymap.cmap")
 ```
 
-`WriteTo` and `ReadFrom` move the data array in 64 KiB chunks, so they are efficient
-even on an unbuffered `*os.File`; wrapping the file in a `bufio.Reader` yourself is
-unnecessary and slightly slower, since it adds a second copy.
+`WriteTo` and `ReadFrom` move the data array in 64 KiB chunks rather than one `uint64`
+at a time. That matters most when the underlying writer or reader is an unbuffered
+`*os.File`, as it is here: a call per word means a syscall per word. For 1,000,000 keys
+(a 9.04 MB file):
+
+| Operation      | Apple M4 Max       | Xeon Gold 6548N   |
+|----------------|--------------------|-------------------|
+| `SaveToFile`   | 1080 ms -> 12.5 ms | 613 ms -> 13.1 ms |
+| `LoadFromFile` | 404 ms -> 9.9 ms   | 370 ms -> 12.9 ms |
+
+There is no need to wrap the file in a `bufio.Reader` yourself; that only adds a second
+copy, and measures slightly slower than handing `ReadFrom` the file directly.
 
 For streaming use, `WriteTo` and `ReadFrom` work with any `io.Writer` / `io.Reader`:
 
@@ -90,65 +99,6 @@ n, err := cm.WriteTo(w)
 var cm constmap.ConstMap
 n, err := cm.ReadFrom(r)
 ```
-
-## Memory-mapped maps
-
-`OpenMapped` reads a saved map straight out of a read-only memory mapping. Nothing
-is copied: the lookup array aliases the file, the kernel faults pages in lazily as
-lookups touch them, several processes mapping the same file share one copy of the
-physical memory, and the bytes never enter the Go heap, so they cost the garbage
-collector nothing.
-
-```go
-m, err := constmap.OpenMapped("mymap.cmap")
-if err != nil {
-	log.Fatal(err)
-}
-defer m.Close()
-
-fmt.Println(m.Map("banana")) // 200
-```
-
-`MappedConstMap` embeds `ConstMap`, so it has the same lookup API; pass `&m.ConstMap`
-to code that expects a `*ConstMap`. That pointer, and any value read through it, is
-valid only until `Close`.
-
-Unlike `LoadFromFile`, `OpenMapped` does not verify the trailing checksum, because
-hashing the file would touch every page and undo the lazy loading that memory mapping
-buys. It does check the magic bytes and that the file is big enough for the header it
-declares. Call `m.Verify()` when integrity matters more than open latency.
-
-How much mapping buys you depends entirely on whether you verify. With 1,000,000
-keys (a 9.04 MB file, warm page cache):
-
-| Opening a saved map     | Verifies? | Apple M4 Max | Xeon Gold 6548N |
-|-------------------------|-----------|--------------|-----------------|
-| `OpenMapped`            | no        | 20.0 us      | 8.63 us         |
-| `OpenMapped` + `Verify` | yes       | 8.71 ms      | 10.7 ms         |
-| `LoadFromFile`          | yes       | 9.61 ms      | 12.9 ms         |
-
-| Lookups       | Apple M4 Max | Xeon Gold 6548N |
-|---------------|--------------|-----------------|
-| Mapped        | 10.3 ns/op   | 18.4 ns/op      |
-| Heap-resident | 8.3 ns/op    | 16.8 ns/op      |
-
-Read that table as two separate stories.
-
-If you skip verification, `OpenMapped` does essentially no work at all -- one `mmap`
-call, no matter how big the file -- and opens roughly 500x faster than reading the
-file. It allocates 456 bytes; `LoadFromFile` allocates the whole 9 MB array.
-
-If you verify, the two nearly converge, at 1.1x on the M4 and 1.2x on the Xeon, because
-`Verify` walks the entire file and both paths become bound by FNV-1a at about 1 GB/s.
-What is left of the gap is the copy that mapping avoids: it hashes the mapped bytes in
-place, rather than decoding them into a fresh 9 MB heap allocation first. Note also
-that verifying faults in every page, which is exactly the lazy loading that mapping was
-supposed to buy you. `Verify` and `OpenMapped` pull in opposite directions; reach for
-`Verify` when you want the integrity check, not when you want a fast open.
-
-So: map when you want a cheap open, a small resident set, or shared pages across
-processes. Read the file when you want the last nanosecond or two per lookup. Both
-are fast; the old 400 ms `LoadFromFile` was not a real ceiling, just a missing buffer.
 
 ## Running Tests
 
@@ -184,8 +134,7 @@ The main benchmarks are:
 - **BenchmarkConstMap** -- lookup throughput for `ConstMap.Map()`
 - **BenchmarkVerifiedConstMap** -- lookup throughput for `VerifiedConstMap.Map()`
 - **BenchmarkGoMap** -- lookup throughput for Go's built-in map
-- **BenchmarkMappedConstMap** -- lookup throughput for a memory-mapped `ConstMap`
-- **BenchmarkOpenMapped** / **BenchmarkLoadFromFile** -- cost of opening a saved map
+- **BenchmarkSaveToFile** / **BenchmarkLoadFromFile** -- serialization throughput
 
 For stable, reproducible results:
 
