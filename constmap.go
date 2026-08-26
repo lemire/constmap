@@ -603,6 +603,46 @@ var magicBytes = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '1'}
 // syscall per word, which dominates everything else. 8192 words is 64 KiB.
 const ioChunkWords = 8192
 
+// chunkBuffer allocates a scratch buffer for moving an array of n words, big
+// enough for one chunk but never larger than the array itself.
+func chunkBuffer(n int) []byte {
+	return make([]byte, min(n, ioChunkWords)*8)
+}
+
+// writeWords encodes words as little-endian uint64s and writes them a chunk at
+// a time, reusing chunk as scratch space.
+func writeWords(w io.Writer, words []uint64, chunk []byte) error {
+	for i := 0; i < len(words); {
+		n := min(len(words)-i, ioChunkWords)
+		b := chunk[:n*8]
+		for j, v := range words[i : i+n] {
+			binary.LittleEndian.PutUint64(b[j*8:], v)
+		}
+		if _, err := w.Write(b); err != nil {
+			return err
+		}
+		i += n
+	}
+	return nil
+}
+
+// readWords fills words from r a chunk at a time, decoding in place. name
+// identifies the array in error messages.
+func readWords(r io.Reader, words []uint64, chunk []byte, name string) error {
+	for i := 0; i < len(words); {
+		n := min(len(words)-i, ioChunkWords)
+		b := chunk[:n*8]
+		if _, err := io.ReadFull(r, b); err != nil {
+			return fmt.Errorf("constmap: reading %s[%d:%d]: %w", name, i, i+n, err)
+		}
+		for j := range words[i : i+n] {
+			words[i+j] = binary.LittleEndian.Uint64(b[j*8:])
+		}
+		i += n
+	}
+	return nil
+}
+
 // WriteTo serializes the ConstMap to w in a portable binary format.
 // A FNV-1a checksum is appended for integrity verification.
 func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
@@ -643,19 +683,8 @@ func (cm *ConstMap) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	// Data, encoded and written a chunk at a time.
-	if len(cm.data) > 0 {
-		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
-		for i := 0; i < len(cm.data); {
-			n := min(len(cm.data)-i, ioChunkWords)
-			b := chunk[:n*8]
-			for j, v := range cm.data[i : i+n] {
-				binary.LittleEndian.PutUint64(b[j*8:], v)
-			}
-			if _, err := mw.Write(b); err != nil {
-				return 0, err
-			}
-			i += n
-		}
+	if err := writeWords(mw, cm.data, chunkBuffer(len(cm.data))); err != nil {
+		return 0, err
 	}
 
 	// Checksum (written to w only, not fed back into the hash).
@@ -712,19 +741,8 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 
 	// Data, read a chunk at a time and decoded in place.
 	cm.data = make([]uint64, dataLen)
-	if len(cm.data) > 0 {
-		chunk := make([]byte, min(len(cm.data), ioChunkWords)*8)
-		for i := 0; i < len(cm.data); {
-			n := min(len(cm.data)-i, ioChunkWords)
-			b := chunk[:n*8]
-			if _, err := io.ReadFull(tr, b); err != nil {
-				return 0, fmt.Errorf("constmap: reading data[%d:%d]: %w", i, i+n, err)
-			}
-			for j := range cm.data[i : i+n] {
-				cm.data[i+j] = binary.LittleEndian.Uint64(b[j*8:])
-			}
-			i += n
-		}
+	if err := readWords(tr, cm.data, chunkBuffer(len(cm.data)), "data"); err != nil {
+		return 0, err
 	}
 
 	// Checksum: read from r directly (not through tee).
@@ -766,4 +784,200 @@ func LoadFromFile(path string) (*ConstMap, error) {
 		return nil, err
 	}
 	return cm, nil
+}
+
+// Binary format for VerifiedConstMap (all little-endian):
+//   [8] magic "VMAP0001"
+//   [8] seed
+//   [4] segmentLength
+//   [4] segmentCount
+//   [4] len(data), which is also len(checks)
+//   [4] zero padding
+//   [8*len(data)] data
+//   [8*len(data)] checks
+//   [8] FNV-1a 64-bit checksum of all preceding bytes
+//
+// The padding brings the header to 32 bytes so that both uint64 arrays start
+// on a 64-bit boundary: data at offset 32, and checks at 32+8*len(data),
+// which is a multiple of eight because the first array is a whole number of
+// words. A reader that maps or otherwise aliases the file can therefore treat
+// either array as []uint64 without a misaligned access.
+//
+// The magic differs from ConstMap's, so feeding a file of one kind to the
+// other's reader is reported rather than silently misinterpreted.
+
+var verifiedMagicBytes = [8]byte{'V', 'M', 'A', 'P', '0', '0', '0', '1'}
+
+// verifiedHeaderSize is the number of bytes preceding the data array,
+// including the padding that aligns it.
+const verifiedHeaderSize = 32
+
+// WriteTo serializes the VerifiedConstMap to w in a portable binary format.
+// A FNV-1a checksum is appended for integrity verification.
+func (vm *VerifiedConstMap) WriteTo(w io.Writer) (int64, error) {
+	if len(vm.checks) != len(vm.data) {
+		return 0, fmt.Errorf("constmap: %d data words but %d check words", len(vm.data), len(vm.checks))
+	}
+
+	h := fnv.New64a()
+	mw := io.MultiWriter(w, h)
+
+	var buf [8]byte
+
+	// Magic.
+	copy(buf[:], verifiedMagicBytes[:])
+	if _, err := mw.Write(buf[:]); err != nil {
+		return 0, err
+	}
+
+	// Seed.
+	binary.LittleEndian.PutUint64(buf[:], vm.seed)
+	if _, err := mw.Write(buf[:]); err != nil {
+		return 0, err
+	}
+
+	// SegmentLength.
+	binary.LittleEndian.PutUint32(buf[:4], vm.segmentLength)
+	if _, err := mw.Write(buf[:4]); err != nil {
+		return 0, err
+	}
+
+	// SegmentCount.
+	binary.LittleEndian.PutUint32(buf[:4], vm.segmentCount)
+	if _, err := mw.Write(buf[:4]); err != nil {
+		return 0, err
+	}
+
+	// Data length, shared by both arrays.
+	binary.LittleEndian.PutUint32(buf[:4], uint32(len(vm.data)))
+	if _, err := mw.Write(buf[:4]); err != nil {
+		return 0, err
+	}
+
+	// Padding, so that both arrays begin on a 64-bit boundary.
+	binary.LittleEndian.PutUint32(buf[:4], 0)
+	if _, err := mw.Write(buf[:4]); err != nil {
+		return 0, err
+	}
+
+	// Both arrays, encoded and written a chunk at a time.
+	chunk := chunkBuffer(len(vm.data))
+	if err := writeWords(mw, vm.data, chunk); err != nil {
+		return 0, err
+	}
+	if err := writeWords(mw, vm.checks, chunk); err != nil {
+		return 0, err
+	}
+
+	// Checksum (written to w only, not fed back into the hash).
+	binary.LittleEndian.PutUint64(buf[:], h.Sum64())
+	if _, err := w.Write(buf[:]); err != nil {
+		return 0, err
+	}
+
+	written := int64(verifiedHeaderSize + 16*len(vm.data) + 8)
+	return written, nil
+}
+
+// ReadFrom deserializes a VerifiedConstMap from r. It verifies the trailing
+// checksum and returns an error if the data is corrupted.
+func (vm *VerifiedConstMap) ReadFrom(r io.Reader) (int64, error) {
+	h := fnv.New64a()
+	tr := io.TeeReader(r, h)
+
+	var buf [8]byte
+
+	// Magic.
+	if _, err := io.ReadFull(tr, buf[:]); err != nil {
+		return 0, fmt.Errorf("constmap: reading magic: %w", err)
+	}
+	if buf != verifiedMagicBytes {
+		if buf == magicBytes {
+			return 0, errors.New("constmap: this is a ConstMap file, use LoadFromFile")
+		}
+		return 0, errors.New("constmap: invalid magic bytes")
+	}
+
+	// Seed.
+	if _, err := io.ReadFull(tr, buf[:]); err != nil {
+		return 0, fmt.Errorf("constmap: reading seed: %w", err)
+	}
+	vm.seed = binary.LittleEndian.Uint64(buf[:])
+
+	// SegmentLength.
+	if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+		return 0, fmt.Errorf("constmap: reading segment length: %w", err)
+	}
+	vm.segmentLength = binary.LittleEndian.Uint32(buf[:4])
+	vm.segmentLengthMask = vm.segmentLength - 1
+
+	// SegmentCount.
+	if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+		return 0, fmt.Errorf("constmap: reading segment count: %w", err)
+	}
+	vm.segmentCount = binary.LittleEndian.Uint32(buf[:4])
+	vm.segmentCountLength = vm.segmentCount * vm.segmentLength
+
+	// Data length, shared by both arrays.
+	if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+		return 0, fmt.Errorf("constmap: reading data length: %w", err)
+	}
+	dataLen := binary.LittleEndian.Uint32(buf[:4])
+
+	// Padding.
+	if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+		return 0, fmt.Errorf("constmap: reading padding: %w", err)
+	}
+
+	// Both arrays, read a chunk at a time and decoded in place.
+	chunk := chunkBuffer(int(dataLen))
+	vm.data = make([]uint64, dataLen)
+	if err := readWords(tr, vm.data, chunk, "data"); err != nil {
+		return 0, err
+	}
+	vm.checks = make([]uint64, dataLen)
+	if err := readWords(tr, vm.checks, chunk, "checks"); err != nil {
+		return 0, err
+	}
+
+	// Checksum: read from r directly (not through tee).
+	expectedSum := h.Sum64()
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, fmt.Errorf("constmap: reading checksum: %w", err)
+	}
+	gotSum := binary.LittleEndian.Uint64(buf[:])
+	if gotSum != expectedSum {
+		return 0, fmt.Errorf("constmap: checksum mismatch (got %016x, expected %016x)", gotSum, expectedSum)
+	}
+
+	read := int64(verifiedHeaderSize + 16*int(dataLen) + 8)
+	return read, nil
+}
+
+// SaveToFile serializes the VerifiedConstMap to a file at the given path.
+func (vm *VerifiedConstMap) SaveToFile(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := vm.WriteTo(f); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// LoadVerifiedFromFile deserializes a VerifiedConstMap from a file at the
+// given path.
+func LoadVerifiedFromFile(path string) (*VerifiedConstMap, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	vm := &VerifiedConstMap{}
+	if _, err := vm.ReadFrom(f); err != nil {
+		return nil, err
+	}
+	return vm, nil
 }
