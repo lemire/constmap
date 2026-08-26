@@ -1,15 +1,22 @@
 package constmap
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"testing/iotest"
 )
 
+// serializedHeaderSize is the number of bytes preceding the data array:
+// magic, seed, segment length, segment count, data length.
+const serializedHeaderSize = 8 + 8 + 4 + 4 + 4
+
 // chunkTestSizes straddles the ioChunkWords boundary, where the chunked
-// encode/decode loops in WriteTo and ReadFrom are easiest to get wrong.
+// encode and decode loops in WriteTo and ReadFrom are easiest to get wrong.
 var chunkTestSizes = []int{
 	0, 1, 2,
 	ioChunkWords - 1, ioChunkWords, ioChunkWords + 1,
@@ -18,7 +25,7 @@ var chunkTestSizes = []int{
 }
 
 // synthetic builds a ConstMap with a data array of exactly n words. The
-// contents are not a valid filter, but serialization does not care and this
+// contents are not a valid filter, but serialization does not care, and this
 // is the only way to pin the array to a chosen length.
 func synthetic(n int) *ConstMap {
 	cm := &ConstMap{
@@ -65,7 +72,7 @@ func TestSerializeChunkBoundaries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := int64(headerSize + 8*n + 8); written != want {
+			if want := int64(serializedHeaderSize + 8*n + 8); written != want {
 				t.Errorf("WriteTo reported %d bytes, want %d", written, want)
 			}
 			if int64(buf.Len()) != written {
@@ -103,8 +110,8 @@ func TestReadFromShortReads(t *testing.T) {
 	assertSameMap(t, &got, cm)
 }
 
-// TestReadFromTruncated checks that a file cut short inside the data array is
-// reported rather than silently accepted.
+// TestReadFromTruncated checks that a stream cut short inside the data array
+// is reported rather than silently accepted.
 func TestReadFromTruncated(t *testing.T) {
 	cm := synthetic(ioChunkWords + 100)
 
@@ -114,7 +121,14 @@ func TestReadFromTruncated(t *testing.T) {
 	}
 	raw := buf.Bytes()
 
-	for _, cut := range []int{headerSize, headerSize + 8, headerSize + 8*ioChunkWords, len(raw) - 9, len(raw) - 1} {
+	cuts := []int{
+		serializedHeaderSize,
+		serializedHeaderSize + 8,
+		serializedHeaderSize + 8*ioChunkWords,
+		len(raw) - 9,
+		len(raw) - 1,
+	}
+	for _, cut := range cuts {
 		var got ConstMap
 		if _, err := got.ReadFrom(bytes.NewReader(raw[:cut])); err == nil {
 			t.Errorf("truncating to %d bytes: expected an error, got nil", cut)
@@ -127,7 +141,8 @@ func TestReadFromTruncated(t *testing.T) {
 // having it dropped.
 func TestWriteToShortWriter(t *testing.T) {
 	cm := synthetic(2 * ioChunkWords)
-	for _, limit := range []int{0, 8, headerSize, headerSize + 8*ioChunkWords - 1} {
+	limits := []int{0, 8, serializedHeaderSize, serializedHeaderSize + 8*ioChunkWords - 1}
+	for _, limit := range limits {
 		if _, err := cm.WriteTo(&failWriter{remaining: limit}); err == nil {
 			t.Errorf("writer failing after %d bytes: expected an error, got nil", limit)
 		}
@@ -145,4 +160,69 @@ func (w *failWriter) Write(p []byte) (int, error) {
 	}
 	w.remaining -= len(p)
 	return len(p), nil
+}
+
+// loadSink keeps benchmark work from being optimized away.
+var loadSink uint64
+
+// benchSavedFile writes an n-key map to a temporary file.
+func benchSavedFile(b *testing.B, n int) string {
+	b.Helper()
+	keys, values := makeBenchData(n)
+	cm, err := New(keys, values)
+	if err != nil {
+		b.Fatal(err)
+	}
+	path := filepath.Join(b.TempDir(), "bench.cmap")
+	if err := cm.SaveToFile(path); err != nil {
+		b.Fatal(err)
+	}
+	return path
+}
+
+func BenchmarkLoadFromFile(b *testing.B) {
+	path := benchSavedFile(b, benchN)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cm, err := LoadFromFile(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		loadSink = cm.data[0]
+	}
+}
+
+// BenchmarkLoadFromFileBuffered guards the claim that callers need not buffer
+// the file themselves: now that ReadFrom moves the data array in chunks, a
+// bufio.Reader only adds a second copy. It should not beat BenchmarkLoadFromFile.
+func BenchmarkLoadFromFileBuffered(b *testing.B) {
+	path := benchSavedFile(b, benchN)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		f, err := os.Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		var cm ConstMap
+		if _, err := cm.ReadFrom(bufio.NewReaderSize(f, 1<<20)); err != nil {
+			b.Fatal(err)
+		}
+		f.Close()
+		loadSink = cm.data[0]
+	}
+}
+
+func BenchmarkSaveToFile(b *testing.B) {
+	keys, values := makeBenchData(benchN)
+	cm, err := New(keys, values)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dir := b.TempDir()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := cm.SaveToFile(filepath.Join(dir, "bench.cmap")); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
