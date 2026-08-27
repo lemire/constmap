@@ -10,7 +10,10 @@ import "github.com/cespare/xxhash/v2"
 //
 // Eight was the best or tied-best of 4, 8, 16, 32 and 64 on an Apple M4 Max
 // and an Intel Xeon Gold 6548N, for maps that fit in last-level cache and for
-// maps several times larger than it.
+// maps several times larger than it. It is also the granularity at which a
+// block is handed to hashManyShort, so it bounds how much work one long key
+// costs: a key of 32 bytes or more drops its whole block back to per-key
+// hashing, and no more than that.
 const batchBlock = 8
 
 // MapMany looks up every key in keys and returns the values in a newly
@@ -43,13 +46,20 @@ func (cm *ConstMap) MapManyInto(dst []uint64, keys []string) {
 	}
 
 	var h0, h1, h2 [batchBlock]uint32
+	var hashes [batchBlock]uint64
 
 	i := 0
 	for ; i+batchBlock <= len(keys); i += batchBlock {
 		block := keys[i : i+batchBlock]
-		for j := range block {
-			hash := mixsplit(xxhash.Sum64String(block[j]), cm.seed)
-			h0[j], h1[j], h2[j] = cm.getHashFromHash(hash)
+		if hashManyShort(block, hashes[:]) {
+			for j := range block {
+				h0[j], h1[j], h2[j] = cm.getHashFromHash(mixsplit(hashes[j], cm.seed))
+			}
+		} else {
+			for j := range block {
+				hash := mixsplit(xxhash.Sum64String(block[j]), cm.seed)
+				h0[j], h1[j], h2[j] = cm.getHashFromHash(hash)
+			}
 		}
 		out := dst[i : i+batchBlock]
 		for j := range out {
@@ -98,10 +108,17 @@ func (vm *VerifiedConstMap) MapManyInto(dst []uint64, keys []string) {
 	i := 0
 	for ; i+batchBlock <= len(keys); i += batchBlock {
 		block := keys[i : i+batchBlock]
-		for j := range block {
-			hash := mixsplit(xxhash.Sum64String(block[j]), vm.seed)
-			hashes[j] = hash
-			h0[j], h1[j], h2[j] = vm.getHashFromHash(hash)
+		if hashManyShort(block, hashes[:]) {
+			for j := range block {
+				hashes[j] = mixsplit(hashes[j], vm.seed)
+				h0[j], h1[j], h2[j] = vm.getHashFromHash(hashes[j])
+			}
+		} else {
+			for j := range block {
+				hash := mixsplit(xxhash.Sum64String(block[j]), vm.seed)
+				hashes[j] = hash
+				h0[j], h1[j], h2[j] = vm.getHashFromHash(hash)
+			}
 		}
 		out := dst[i : i+batchBlock]
 		for j := range out {
