@@ -64,6 +64,40 @@ fmt.Println(vm.Map("grape"))  // constmap.NotFound (0xFFFFFFFFFFFFFFFF)
 
 This doubles memory usage (~18 bytes/key instead of ~9) but lookup remains fast.
 
+## Batched Lookups
+
+If you have many keys to look up at once, `MapMany` takes a slice of strings and
+returns a slice of values, where `result[i]` corresponds to `keys[i]`:
+
+```go
+values := cm.MapMany([]string{"apple", "banana", "cherry"}) // [100 200 300]
+```
+
+`VerifiedConstMap` has the same method, and still reports absent keys as `NotFound`:
+
+```go
+values := vm.MapMany([]string{"banana", "grape"}) // [200 NotFound]
+```
+
+Use `MapManyInto(dst, keys)` if you are looking up batch after batch and would
+rather reuse a buffer than allocate one each time. It fills `dst[:len(keys)]` and
+panics if `dst` is shorter than `keys`.
+
+A batch is faster than the loop it replaces, because it hashes a block of keys
+before gathering any values, which lets the array accesses of the whole block be in
+flight at once instead of each key's loads waiting behind the previous key's
+hashing. With 1,000,000 keys:
+
+| Lookup             | Apple M4 Max          | Xeon Gold 6548N        |
+|--------------------|-----------------------|------------------------|
+| `ConstMap`         | 9.7 -> 8.0 ns/key     | 9.7 -> 8.9 ns/key      |
+| `VerifiedConstMap` | 11.3 -> 10.0 ns/key   | 18.2 -> 13.9 ns/key    |
+
+The verified map gains more on the Xeon because it touches two arrays per lookup,
+so there is more memory latency to hide. How much you gain depends on the machine
+and on how much of the map fits in cache: a map small enough to sit in a large
+last-level cache has little latency left to hide, and can come out roughly even.
+
 ## Serialization
 
 A `ConstMap` can be serialized to disk and loaded back later, avoiding the cost of reconstruction. The binary format includes a FNV-1a checksum to detect corruption.
@@ -153,6 +187,8 @@ The main benchmarks are:
 - **BenchmarkConstMap** -- lookup throughput for `ConstMap.Map()`
 - **BenchmarkVerifiedConstMap** -- lookup throughput for `VerifiedConstMap.Map()`
 - **BenchmarkGoMap** -- lookup throughput for Go's built-in map
+- **BenchmarkConstMapMany** / **BenchmarkVerifiedConstMapMany** -- batched lookup, against
+  **BenchmarkConstMapLoop** / **BenchmarkVerifiedConstMapLoop** for the loop they replace
 - **BenchmarkSaveToFile** / **BenchmarkLoadFromFile** -- serialization throughput
 - **BenchmarkVerifiedSaveToFile** / **BenchmarkLoadVerifiedFromFile** -- the same for `VerifiedConstMap`
 
