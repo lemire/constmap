@@ -1,3 +1,5 @@
+//go:build !purego
+
 #include "textflag.h"
 
 // Registers, matching github.com/cespare/xxhash/v2's naming where this

@@ -66,7 +66,7 @@ This doubles memory usage (~18 bytes/key instead of ~9) but lookup remains fast.
 
 ## Batched Lookups
 
-If you have many keys to look up at once, `MapMany` takes a slice of strings and
+If you have many keys to resolve at once, `MapMany` takes a slice of strings and
 returns a slice of values, where `result[i]` corresponds to `keys[i]`:
 
 ```go
@@ -79,24 +79,81 @@ values := cm.MapMany([]string{"apple", "banana", "cherry"}) // [100 200 300]
 values := vm.MapMany([]string{"banana", "grape"}) // [200 NotFound]
 ```
 
-Use `MapManyInto(dst, keys)` if you are looking up batch after batch and would
-rather reuse a buffer than allocate one each time. It fills `dst[:len(keys)]` and
-panics if `dst` is shorter than `keys`.
+If you resolve batch after batch, `MapManyInto` writes into a buffer you own
+instead of allocating a new one each time. It fills `dst[:len(keys)]`, leaves the
+rest of `dst` untouched, and panics if `dst` is shorter than `keys`:
 
-A batch is faster than the loop it replaces, because it hashes a block of keys
-before gathering any values, which lets the array accesses of the whole block be in
-flight at once instead of each key's loads waiting behind the previous key's
-hashing. With 1,000,000 keys:
+```go
+dst := make([]uint64, 4096)
+for _, batch := range batches {
+	cm.MapManyInto(dst, batch)
+	use(dst[:len(batch)])
+}
+```
 
-| Lookup             | Apple M4 Max          | Xeon Gold 6548N        |
-|--------------------|-----------------------|------------------------|
-| `ConstMap`         | 9.7 -> 8.0 ns/key     | 9.7 -> 8.9 ns/key      |
-| `VerifiedConstMap` | 11.3 -> 10.0 ns/key   | 18.2 -> 13.9 ns/key    |
+Both are exactly equivalent to calling `Map` on each key in turn. They are faster
+for two reasons.
 
-The verified map gains more on the Xeon because it touches two arrays per lookup,
-so there is more memory latency to hide. How much you gain depends on the machine
-and on how much of the map fits in cache: a map small enough to sit in a large
-last-level cache has little latency left to hide, and can come out roughly even.
+**Overlapping the memory accesses.** A batch hashes a block of eight keys before
+gathering any values. That lets the three array accesses of all eight keys be in
+flight at once, instead of each key's loads waiting behind the previous key's
+hashing. A lookup is memory-latency-bound whenever the map is larger than
+last-level cache, so this is where most of the gain comes from on a fresh batch.
+
+**Hashing a block in one call.** On amd64 and arm64 the eight keys are hashed by a
+single assembly routine that keeps the five XXH64 prime constants in registers for
+the whole block, rather than reloading them and paying a function call per key. It
+is bit-for-bit identical to `xxhash.Sum64String`, and a test checks that
+exhaustively for every input length it accepts. Keys of 32 bytes or more are not
+covered by it; a block containing one falls back to per-key hashing, and nothing
+else is affected.
+
+### Measured
+
+2,000-key batch against a 1,000,000-key map, ns/key, medians of
+`-benchtime 3s -count 3`. *Cold* rotates through 64 distinct random batches so the
+touched cache lines are not already resident; *hot* replays one batch, so the
+touched region of the array stays cache-resident and hashing dominates instead.
+
+| | | loop over `Map` | `MapMany` | |
+|---|---|---|---|---|
+| **Apple M4 Max** | `ConstMap` cold | 16.0 | **8.9** | 45% |
+| | `ConstMap` hot | 9.9 | **5.6** | 43% |
+| | `VerifiedConstMap` cold | 24.1 | **14.8** | 39% |
+| | `VerifiedConstMap` hot | 11.0 | **7.2** | 35% |
+| **Xeon Gold 6548N** | `ConstMap` cold | 18.9 | **15.4** | 19% |
+| | `ConstMap` hot | 9.7 | **7.8** | 19% |
+| | `VerifiedConstMap` cold | 25.3 | **19.8** | 22% |
+| | `VerifiedConstMap` hot | 12.5 | **9.4** | 25% |
+
+The two effects split differently by platform. Turning the batched hasher off and
+leaving everything else identical costs 34% cold and 29% hot on the M4 Max, but
+only 3.5% cold and 14% hot on the Xeon. The assembly earns much more on arm64
+because materializing a 64-bit constant there takes a multi-instruction
+`MOVZ`/`MOVK` sequence, so hoisting the five primes into registers saves real work;
+on x86-64 each prime is one `MOVQ` from memory, or free as a RIP-relative operand,
+so there is less to hoist. In isolation the batched hasher runs at 1.9 ns/key
+against cespare's 3.4 on the M4 Max, and 6.4 against 8.3 on the Xeon.
+
+### Platform support
+
+| | batched hasher | falls back to |
+|---|---|---|
+| arm64 | `hashbatch_arm64.s` | -- |
+| amd64 | `hashbatch_amd64.s` | -- |
+| everything else, or `-tags purego` | none | per-key `xxhash.Sum64String` |
+
+Both assembly routines are plain scalar code with no CPU feature gate, so they run
+on every arm64 and every x86-64 machine. On platforms without one, `MapMany` still
+does the phase separation and is still faster than a loop; only the hashing half of
+the gain is missing. Results are identical either way.
+
+There is no SIMD variant. XXH64's short-input path is a serial
+multiply-and-rotate chain per key, so the win from vectorizing would have to come
+from putting several keys in several lanes -- but AVX2 has no 64x64 multiply
+(`VPMULLQ` is AVX-512DQ), and even with AVX-512 the cost of marshalling eight keys
+at eight different addresses and eight different lengths into lanes, then masking
+through a byte-at-a-time tail, is very likely to exceed what the multiplies save.
 
 ## Serialization
 
@@ -168,8 +225,10 @@ The main benchmarks are:
 - **BenchmarkConstMap** -- lookup throughput for `ConstMap.Map()`
 - **BenchmarkVerifiedConstMap** -- lookup throughput for `VerifiedConstMap.Map()`
 - **BenchmarkGoMap** -- lookup throughput for Go's built-in map
-- **BenchmarkConstMapMany** / **BenchmarkVerifiedConstMapMany** -- batched lookup, against
-  **BenchmarkConstMapLoop** / **BenchmarkVerifiedConstMapLoop** for the loop they replace
+- **BenchmarkMapMany_Cold** / **BenchmarkMapMany_Hot** -- batched lookup, against
+  **BenchmarkBatchNaive_Cold** / **BenchmarkBatchNaive_Hot** for the loop it replaces
+  (and the **Verified** prefixed equivalents for `VerifiedConstMap`)
+- **BenchmarkHashBatchOnly** -- the batched hasher against per-key `xxhash.Sum64String`
 - **BenchmarkSaveToFile** / **BenchmarkLoadFromFile** -- serialization throughput
 
 For stable, reproducible results:
