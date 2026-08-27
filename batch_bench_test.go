@@ -2,6 +2,7 @@ package constmap
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +16,13 @@ const (
 // keys drawn from allKeys, so repeated benchmark iterations don't just replay
 // the exact same 2000 keys (which would go cache-resident and understate the
 // cost of a genuinely fresh batch against a 9MB+ table).
+// The keys are cloned rather than aliased. allKeys holds its string bodies in
+// index order, so copying the headers out of it would leave the bodies
+// scattered and charge every lookup for a random walk over this file's own key
+// text -- about 1.6 to 2.6 ns per key here, and far more with larger pools.
+// That cost belongs to whatever produced the keys, not to the map. Cloning in
+// draw order gives each pool the compact layout a caller holding a batch of
+// keys would have. See makeQueryOrder in constmap_test.go.
 func makeQueryBatches(allKeys []string, seed int64, pools int) [][]string {
 	rng := rand.New(rand.NewSource(seed))
 	batches := make([][]string, pools)
@@ -22,7 +30,7 @@ func makeQueryBatches(allKeys []string, seed int64, pools int) [][]string {
 		perm := rng.Perm(len(allKeys))[:batchSize]
 		b := make([]string, batchSize)
 		for i, j := range perm {
-			b[i] = allKeys[j]
+			b[i] = strings.Clone(allKeys[j])
 		}
 		batches[p] = b
 	}

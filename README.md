@@ -117,18 +117,24 @@ touched region of the array stays cache-resident and hashing dominates instead.
 
 | | | loop over `Map` | `MapMany` | |
 |---|---|---|---|---|
-| **Apple M4 Max** | `ConstMap` cold | 16.0 | **8.9** | 45% |
-| | `ConstMap` hot | 9.9 | **5.6** | 43% |
-| | `VerifiedConstMap` cold | 24.1 | **14.8** | 39% |
-| | `VerifiedConstMap` hot | 11.0 | **7.2** | 35% |
-| **Xeon Gold 6548N** | `ConstMap` cold | 18.9 | **15.4** | 19% |
-| | `ConstMap` hot | 9.7 | **7.8** | 19% |
-| | `VerifiedConstMap` cold | 25.3 | **19.8** | 22% |
-| | `VerifiedConstMap` hot | 12.5 | **9.4** | 25% |
+| **Apple M4 Max** | `ConstMap` cold | 11.6 | **6.2** | 47% |
+| | `ConstMap` hot | 8.8 | **4.9** | 44% |
+| | `VerifiedConstMap` cold | 17.2 | **10.6** | 39% |
+| | `VerifiedConstMap` hot | 9.9 | **6.6** | 34% |
+| **Xeon Gold 6548N** | `ConstMap` cold | 16.4 | **13.2** | 19% |
+| | `ConstMap` hot | 9.4 | **7.1** | 24% |
+| | `VerifiedConstMap` cold | 20.3 | **20.0** | ~0% |
+| | `VerifiedConstMap` hot | 12.1 | **8.8** | 27% |
+
+The one place batching does not pay is `VerifiedConstMap` in the cold regime on the Xeon, where
+the difference is inside the run-to-run spread. That map probes two arrays per lookup, and on a
+fresh batch it is bound by memory latency the batching cannot hide; the same case on the M4 Max,
+which has less memory-level parallelism to begin with, still gains 39%.
 
 The two effects split differently by platform. Turning the batched hasher off and
 leaving everything else identical costs 34% cold and 29% hot on the M4 Max, but
-only 3.5% cold and 14% hot on the Xeon. The assembly earns much more on arm64
+only 3.5% cold and 14% hot on the Xeon (measured before this benchmark revision;
+the split, not the absolute figures). The assembly earns much more on arm64
 because materializing a 64-bit constant there takes a multi-instruction
 `MOVZ`/`MOVK` sequence, so hoisting the five primes into registers saves real work;
 on x86-64 each prime is one `MOVQ` from memory, or free as a RIP-relative operand,
@@ -218,18 +224,59 @@ go test -v
 
 ## Performance gains
 
-The construction time is higher (as expected for any compact data structure), but lookups are optimized for speed. I ran benchmarks on my Apple M4 Max processor to compare constmap lookups against Go's built-in `map[string]uint64`. The test uses 1 million keys.
+The construction time is higher (as expected for any compact data structure), but lookups are
+optimized for speed. Benchmarked on an Apple M4 Max against Go's built-in `map[string]uint64`,
+with 1 million keys:
 
-| Data Structure    | Lookup Time | Memory Usage |
-|-------------------|-------------|--------------|
-| ConstMap          | 7.6 ns/op   | 9 bytes/key  |
-| VerifiedConstMap  | 13 ns/op    | 18 bytes/key |
-| Go Map            | 23 ns/op    | 56 bytes/key |
+| Data Structure    | Lookup Time | Memory Usage   |
+|-------------------|-------------|----------------|
+| ConstMap          | 8.7 ns/op   | 9.0 bytes/key  |
+| VerifiedConstMap  | 15 ns/op    | 18 bytes/key   |
+| Go Map            | 46 ns/op    | 48 bytes/key   |
 
+The speed varies depending on your system, the size of your dataset, the keys, the order of the
+lookup and so forth. If it can reside in CPU cache while the map cannot, then it will be
+significantly faster.
 
-The speed varies depending on your system, the size of your dataset, the keys, the order of the lookup and so forth. If it can reside in CPU cache while the map cannot, then it will be significantly faster. 
+The memory usage should always be significantly better with `ConstMap` as long as you have many
+thousands of keys.
 
-The memory usage should always be significantly better with `ConstMap` as long as you have many thousands of keys.
+### How these are measured
+
+Lookup benchmarks query every key exactly once, in random order, from a buffer built in that
+order (`makeQueryOrder`). Both halves of that are deliberate, and both change the answer a lot.
+
+*Random order* is what exercises the map. Walking the keys in the order they were constructed is
+a pattern no caller has, and it lets the hardware prefetcher hide work a real lookup must do.
+
+*A buffer built in query order* is what keeps the measurement about the map. The key text is
+allocated in index order, so merely permuting the slice would leave every string body where it
+was and add a scattered, dependency-carrying load to each lookup -- you cannot hash a key before
+reading its bytes. That cost is real, but it belongs to whatever produced the keys, not to the
+map: it adds roughly 11 ns per lookup at a million keys and roughly 52 ns at four million,
+growing with the size of the benchmark's own key array rather than with anything about the data
+structure.
+
+Querying the whole key set, rather than a small sample, is deliberate too. A small sample keeps
+the key text in cache, but it also leaves most of the map untouched and cache-resident, which
+flatters every implementation and hides exactly the compactness that is the point. Over 256
+queries `ConstMap` beats Go's map by 1.2x; over the whole key set, by 5.3x. Same code, same map.
+
+### Scaling
+
+One pass over the whole key set, so every lookup is a first touch. `go test -run
+TestLookupAndMemoryTable -v` with `RUN_HEAVY_MEMORY_TESTS=1`, Apple M4 Max:
+
+| keys       | ConstMap | VerifiedConstMap | Go map | ConstMap bytes/key | Go map bytes/key |
+|------------|----------|------------------|--------|--------------------|------------------|
+| 10,000     | 9.4 ns   | 10.4 ns          | 14.8 ns| 10.2               | 31.4             |
+| 100,000    | 8.0 ns   | 9.5 ns           | 13.6 ns| 9.5                | 26.9             |
+| 1,000,000  | 12.5 ns  | 18.6 ns          | 51.1 ns| 9.0                | 47.9             |
+| 10,000,000 | 34.8 ns  | 41.3 ns          | 70.1 ns| 9.0                | 36.7             |
+
+The margin grows with the key count, which is the expected shape: at ten thousand keys everything
+fits in cache and the compactness buys little, while at a million and beyond it is most of the
+story.
 
 ## Benchmarks
 
