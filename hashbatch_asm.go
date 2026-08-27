@@ -1,8 +1,10 @@
+//go:build (amd64 || arm64) && !purego
+
 package constmap
 
-// xxhPrimesBatch holds the XXH64 prime constants in a contiguous array so
-// hashbatch_arm64.s can load all five with two LDP instructions plus one
-// MOVD. Values match github.com/cespare/xxhash/v2's own (unexported, so not
+// xxhPrimesBatch holds the XXH64 prime constants in a contiguous array so the
+// assembly can load all five in a few instructions: two LDPs plus a MOVD on
+// arm64, five MOVQs on amd64. Values match github.com/cespare/xxhash/v2's own (unexported, so not
 // safe to reference directly from our assembly) prime table; declared here
 // so hashKeysXXH64Short has no dependency on that package's internal layout.
 var xxhPrimesBatch = [5]uint64{
@@ -16,7 +18,7 @@ var xxhPrimesBatch = [5]uint64{
 // hashKeysXXH64Short computes the XXH64 (zero seed) digest of each keys[i]
 // into out[i]. Every key must be shorter than 32 bytes; behavior is
 // undefined (a wrong hash, not a crash) for any key that isn't — callers
-// must check lengths first. See hashbatch_arm64.s for why this exists: it
+// must check lengths first. See hashbatch_arm64.s and hashbatch_amd64.s for why this exists: it
 // amortizes the fixed per-call cost (register setup, loading the five xxHash
 // primes) across a whole batch instead of paying it once per key the way
 // calling github.com/cespare/xxhash/v2.Sum64String per key does.
