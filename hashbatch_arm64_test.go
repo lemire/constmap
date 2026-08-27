@@ -48,7 +48,7 @@ func TestHashKeysXXH64ShortMatchesReference(t *testing.T) {
 	}
 }
 
-func TestMapBatchLongKeyFallback(t *testing.T) {
+func TestMapManyLongKeyFallback(t *testing.T) {
 	n := 2000
 	keys := make([]string, n)
 	values := make([]uint64, n)
@@ -72,14 +72,14 @@ func TestMapBatchLongKeyFallback(t *testing.T) {
 	}
 
 	out := make([]uint64, n)
-	cm.MapBatch(keys, out)
+	cm.MapManyInto(out, keys)
 	for i, k := range keys {
 		want := cm.Map(k)
 		if out[i] != want {
-			t.Errorf("i=%d: MapBatch(%q) = %d, want %d", i, k, out[i], want)
+			t.Errorf("i=%d: MapMany(%q) = %d, want %d", i, k, out[i], want)
 		}
 		if out[i] != values[i] {
-			t.Errorf("i=%d: MapBatch(%q) = %d, want value %d", i, k, out[i], values[i])
+			t.Errorf("i=%d: MapMany(%q) = %d, want value %d", i, k, out[i], values[i])
 		}
 	}
 }

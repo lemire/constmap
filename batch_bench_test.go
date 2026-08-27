@@ -31,146 +31,119 @@ func makeQueryBatches(allKeys []string, seed int64, pools int) [][]string {
 
 var batchSink uint64
 
-// BenchmarkBatchNaive_Cold measures batch lookup where each b.N iteration
-// queries a different random 2000-key batch, cycling through numBatchPools
-// distinct batches. This approximates the real workload: 2000 keys you
-// haven't just looked up, against a 1M-entry table that doesn't fit L1/L2.
+// The four benchmarks below pair a cold and a hot regime for each map type.
+// Cold rotates through numBatchPools distinct random batches, so the touched
+// cache lines are not already resident and the measurement is dominated by
+// memory latency. Hot replays one batch, so the touched region goes
+// cache-resident and hashing dominates instead. Batching helps in both, but
+// for different reasons, and a single regime would hide one of them.
+
+func benchBatchSetup(b *testing.B) (*ConstMap, *VerifiedConstMap, [][]string, []uint64) {
+	b.Helper()
+	keys, values := makeBenchData(batchMapN)
+	cm, err := New(keys, values)
+	if err != nil {
+		b.Fatal(err)
+	}
+	vm, err := NewVerified(keys, values)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return cm, vm, makeQueryBatches(keys, 1, numBatchPools), make([]uint64, batchSize)
+}
+
 func BenchmarkBatchNaive_Cold(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, numBatchPools)
-	out := make([]uint64, batchSize)
-
+	cm, _, batches, out := benchBatchSetup(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		q := batches[i%numBatchPools]
-		for j, k := range q {
+		for j, k := range batches[i%numBatchPools] {
 			out[j] = cm.Map(k)
 		}
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
-	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
 }
 
-// BenchmarkBatchNaive_Hot repeats the SAME 2000-key batch every iteration.
-// After the first pass the touched cache lines (~2000*3*cachelinesize) are
-// L2-resident, so this measures steady-state/repeated-query performance
-// rather than a fresh batch against cold memory.
 func BenchmarkBatchNaive_Hot(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, 1)
+	cm, _, batches, out := benchBatchSetup(b)
 	q := batches[0]
-	out := make([]uint64, batchSize)
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for j, k := range q {
 			out[j] = cm.Map(k)
 		}
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
-	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
 }
 
-func BenchmarkMapBatch_Cold(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, numBatchPools)
-	out := make([]uint64, batchSize)
-
+func BenchmarkMapMany_Cold(b *testing.B) {
+	cm, _, batches, out := benchBatchSetup(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		q := batches[i%numBatchPools]
-		cm.MapBatch(q, out)
+		cm.MapManyInto(out, batches[i%numBatchPools])
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
-	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
 }
 
-func BenchmarkMapBatch_Hot(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, 1)
+func BenchmarkMapMany_Hot(b *testing.B) {
+	cm, _, batches, out := benchBatchSetup(b)
 	q := batches[0]
-	out := make([]uint64, batchSize)
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cm.MapBatch(q, out)
+		cm.MapManyInto(out, q)
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
-	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
 }
 
-func BenchmarkMapBatchParallel_Cold(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, numBatchPools)
-	out := make([]uint64, batchSize)
-
+func BenchmarkVerifiedBatchNaive_Cold(b *testing.B) {
+	_, vm, batches, out := benchBatchSetup(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		q := batches[i%numBatchPools]
-		cm.MapBatchParallel(q, out)
+		for j, k := range batches[i%numBatchPools] {
+			out[j] = vm.Map(k)
+		}
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
-	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
 }
 
-func BenchmarkMapBatchParallel_Hot(b *testing.B) {
-	keys, values := makeBenchData(batchMapN)
-	cm, err := New(keys, values)
-	if err != nil {
-		b.Fatal(err)
-	}
-	batches := makeQueryBatches(keys, 1, 1)
+func BenchmarkVerifiedBatchNaive_Hot(b *testing.B) {
+	_, vm, batches, out := benchBatchSetup(b)
 	q := batches[0]
-	out := make([]uint64, batchSize)
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cm.MapBatchParallel(q, out)
+		for j, k := range q {
+			out[j] = vm.Map(k)
+		}
 	}
-	var s uint64
-	for _, v := range out {
-		s += v
+	reportNsPerKey(b)
+	batchSink = out[0]
+}
+
+func BenchmarkVerifiedMapMany_Cold(b *testing.B) {
+	_, vm, batches, out := benchBatchSetup(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vm.MapManyInto(out, batches[i%numBatchPools])
 	}
-	batchSink = s
-	b.ReportMetric(float64(batchSize), "keys/batch")
+	reportNsPerKey(b)
+	batchSink = out[0]
+}
+
+func BenchmarkVerifiedMapMany_Hot(b *testing.B) {
+	_, vm, batches, out := benchBatchSetup(b)
+	q := batches[0]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vm.MapManyInto(out, q)
+	}
+	reportNsPerKey(b)
+	batchSink = out[0]
+}
+
+func reportNsPerKey(b *testing.B) {
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*batchSize), "ns/key")
 }
