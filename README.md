@@ -64,6 +64,51 @@ fmt.Println(vm.Map("grape"))  // constmap.NotFound (0xFFFFFFFFFFFFFFFF)
 
 This doubles memory usage (~18 bytes/key instead of ~9) but lookup remains fast.
 
+### Paired Layout
+
+`VerifiedConstMap` keeps its values and its fingerprints in two separate arrays,
+so a lookup of a present key reads three fingerprint words and then three value
+words: six cache lines, in two different places. `PairedVerifiedConstMap` is the
+same map with each value stored next to its fingerprint, so the three reads bring
+in both at once and a lookup touches three cache lines instead of six:
+
+```go
+pm, err := constmap.NewPaired(keys, values)
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Println(pm.Map("banana")) // 200
+fmt.Println(pm.Map("grape"))  // constmap.NotFound
+```
+
+It has exactly the semantics, memory footprint and API of `VerifiedConstMap`
+(`Map`, `MapMany`, `MapManyInto`, `SaveToFile`, `LoadPairedFromFile`), and an
+existing `VerifiedConstMap` converts with `vm.Paired()`. The difference is which
+keys it is fast for:
+
+- **Present keys**: fewer cache lines, so faster. Random lookups over a million
+  keys run 5% faster than `VerifiedConstMap.Map` on an Apple M4 Max and 6% on an
+  Intel Xeon Gold 6548N while the map sits in the last-level cache; at ten million
+  keys, where it does not, 19% on the Xeon.
+- **Absent keys**: slower. `VerifiedConstMap.Map` stops after reading the
+  fingerprint array, which is half the size of the whole map and so far more
+  likely to be cache-resident, whereas the paired map always brings the value in
+  alongside the fingerprint, so its working set for misses is twice as large.
+- **Batches**: `MapMany` overlaps the memory accesses of eight keys, which
+  hides some of the extra latency either way, but the paired layout still wins
+  on present keys: 12% faster cold on the M4 Max and 27% on the Xeon (table
+  below).
+
+Use `PairedVerifiedConstMap` when most of the keys you look up are present, and
+`VerifiedConstMap` when most are absent. Its serialized format has its own magic
+bytes (`PMAP0001`) and is not interchangeable with `VerifiedConstMap`'s.
+
+On amd64 and arm64, `MapMany` resolves each block of eight keys with a small
+assembly routine that loads each 16-byte slot as one vector (SSE2 or NEON) and
+XORs the three slots with two vector instructions. Build with `-tags purego` to
+use the portable Go version instead.
+
 ## Batched Lookups
 
 If you have many keys to resolve at once, `MapMany` takes a slice of strings and
@@ -73,7 +118,8 @@ returns a slice of values, where `result[i]` corresponds to `keys[i]`:
 values := cm.MapMany([]string{"apple", "banana", "cherry"}) // [100 200 300]
 ```
 
-`VerifiedConstMap` has the same method, and still reports absent keys as `NotFound`:
+`VerifiedConstMap` and `PairedVerifiedConstMap` have the same method, and still
+report absent keys as `NotFound`:
 
 ```go
 values := vm.MapMany([]string{"banana", "grape"}) // [200 NotFound]
@@ -121,10 +167,14 @@ touched region of the array stays cache-resident and hashing dominates instead.
 | | `ConstMap` hot | 8.8 | **4.9** | 44% |
 | | `VerifiedConstMap` cold | 17.2 | **10.6** | 39% |
 | | `VerifiedConstMap` hot | 9.9 | **6.6** | 34% |
+| | `PairedVerifiedConstMap` cold | 14.2 | **8.2** | 42% |
+| | `PairedVerifiedConstMap` hot | 8.9 | **5.4** | 39% |
 | **Xeon Gold 6548N** | `ConstMap` cold | 16.4 | **13.2** | 19% |
 | | `ConstMap` hot | 9.4 | **7.1** | 24% |
 | | `VerifiedConstMap` cold | 20.3 | **20.0** | ~0% |
 | | `VerifiedConstMap` hot | 12.1 | **8.8** | 27% |
+| | `PairedVerifiedConstMap` cold | 19.6 | **14.6** | 25% |
+| | `PairedVerifiedConstMap` hot | 11.6 | **7.9** | 32% |
 
 The one place batching does not pay is `VerifiedConstMap` in the cold regime on the Xeon, where
 the difference is inside the run-to-run spread. That map probes two arrays per lookup, and on a
@@ -186,18 +236,21 @@ at a time. That matters most when the underlying writer or reader is an unbuffer
 There is no need to wrap the file in a `bufio.Reader` yourself; that only adds a second
 copy, and measures slightly slower than handing `ReadFrom` the file directly.
 
-`VerifiedConstMap` serializes the same way, into its own format:
+`VerifiedConstMap` and `PairedVerifiedConstMap` serialize the same way, each into
+its own format:
 
 ```go
 // Save to file.
 err := vm.SaveToFile("myverifiedmap.cmap")
+err = pm.SaveToFile("mypairedmap.cmap")
 
 // Load from file.
 vm, err := constmap.LoadVerifiedFromFile("myverifiedmap.cmap")
+pm, err := constmap.LoadPairedFromFile("mypairedmap.cmap")
 ```
 
-The two formats carry different magic bytes, so handing a file of one kind to the
-other kind's reader is reported rather than silently misinterpreted.
+The three formats carry different magic bytes, so handing a file of one kind to
+another kind's reader is reported rather than silently misinterpreted.
 
 The verified format pads its header to 32 bytes so that both `uint64` arrays begin on
 a 64-bit boundary: `data` at offset 32, and `checks` at `32 + 8*len(data)`, which is a
@@ -215,6 +268,37 @@ n, err := cm.WriteTo(w)
 var cm constmap.ConstMap
 n, err := cm.ReadFrom(r)
 ```
+
+### Interoperability with the Rust and Python implementations
+
+The formats are shared with [rsconstmap](https://github.com/lemire/rsconstmap)
+(Rust) and [fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python
+bindings): a map saved by any of the three loads in the other two, on a
+little-endian host (which is every mainstream one: x86-64, ARM64, RISC-V, Apple
+silicon). The three share the key hash (XXH64), the mixing, the seed sequence and
+the layout, so for the same input this package and rsconstmap write byte-identical
+files, and fastconstmap writes the same bytes apart from one header word:
+
+- `VerifiedConstMap` (`VMAP0001`) and `PairedVerifiedConstMap` (`PMAP0001`) are
+  identical across the three. fastconstmap stores its key count in the header word
+  this package leaves as zero padding; every reader ignores the word.
+- `ConstMap` files from fastconstmap carry the magic `CMAP0003`: this package's
+  `CMAP0001` plus that 4-byte key count after the data length. `ReadFrom` accepts
+  both and ignores the count.
+
+```go
+vm, err := constmap.LoadVerifiedFromFile("built-by-python.vmap") // from VerifiedConstMap.save
+cm, err := constmap.LoadFromFile("built-by-rust.cmap")           // from ConstMap::save_to_file
+```
+
+Files written by fastconstmap 0.9 and earlier (`CMAP0002`, `VCMP0002`) used a
+different key hash (XXH3) and cannot be loaded here; `ReadFrom` says so rather than
+reporting an invalid file. fastconstmap 0.10 and later still read them, and a map
+rebuilt from its keys there writes the shared format.
+
+The interoperability is tested: `testdata/interop/` holds files written by the other
+two implementations from a fixed input, which `interop_test.go` loads and checks, and
+it checks that this package writes exactly the bytes rsconstmap wrote.
 
 ## Running Tests
 
@@ -290,10 +374,12 @@ The main benchmarks are:
 
 - **BenchmarkConstMap** -- lookup throughput for `ConstMap.Map()`
 - **BenchmarkVerifiedConstMap** -- lookup throughput for `VerifiedConstMap.Map()`
+- **BenchmarkPairedConstMap** -- the same for `PairedVerifiedConstMap.Map()`
 - **BenchmarkGoMap** -- lookup throughput for Go's built-in map
 - **BenchmarkMapMany_Cold** / **BenchmarkMapMany_Hot** -- batched lookup, against
   **BenchmarkBatchNaive_Cold** / **BenchmarkBatchNaive_Hot** for the loop it replaces
-  (and the **Verified** prefixed equivalents for `VerifiedConstMap`)
+  (and the **Verified** and **Paired** prefixed equivalents for `VerifiedConstMap`
+  and `PairedVerifiedConstMap`)
 - **BenchmarkHashBatchOnly** -- the batched hasher against per-key `xxhash.Sum64String`
 - **BenchmarkSaveToFile** / **BenchmarkLoadFromFile** -- serialization throughput
 - **BenchmarkVerifiedSaveToFile** / **BenchmarkLoadVerifiedFromFile** -- the same for `VerifiedConstMap`

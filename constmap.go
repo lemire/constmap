@@ -5,6 +5,10 @@
 //
 // Lookup is extremely fast: one xxhash call plus three array accesses and two XORs.
 // The data structure is immutable after construction.
+//
+// The serialized formats are shared with rsconstmap (Rust) and fastconstmap
+// (C/Python): a map saved by any of the three loads in the other two, on a
+// little-endian host.
 package constmap
 
 import (
@@ -594,8 +598,32 @@ func (vm *VerifiedConstMap) Map(key string) uint64 {
 //   [4] len(data)
 //   [8*len(data)] data
 //   [8] FNV-1a 64-bit checksum of all preceding bytes
+//
+// The formats of this package are shared with rsconstmap (Rust) and
+// fastconstmap (C/Python): a file written by any of the three loads in the
+// other two, on a little-endian host. fastconstmap writes its ConstMaps with
+// magic "CMAP0003", which is this format with a fourth 4-byte header field
+// holding the original key count (so that its len() survives a save and
+// load); ReadFrom accepts it and ignores the count. It also reads the
+// "CMAP0002" files fastconstmap 0.9 and earlier wrote, which hashed keys
+// with XXH3 rather than XXH64 and so cannot be used here; ReadFrom names
+// them so the user knows to rebuild the map with a current fastconstmap.
 
 var magicBytes = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '1'}
+
+// magicBytesCounted is fastconstmap's ConstMap magic: CMAP0001 plus a key
+// count field after the data length.
+var magicBytesCounted = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '3'}
+
+// Magics of files written by fastconstmap 0.9 and earlier, which used a
+// different key hash. They cannot be loaded, only recognized.
+var (
+	legacyFastMagicBytes         = [8]byte{'C', 'M', 'A', 'P', '0', '0', '0', '2'}
+	legacyFastVerifiedMagicBytes = [8]byte{'V', 'C', 'M', 'P', '0', '0', '0', '2'}
+)
+
+// errLegacyFastconstmap explains a file that only fastconstmap 0.9 can read.
+var errLegacyFastconstmap = errors.New("constmap: this file was written by fastconstmap 0.9 or earlier with a different key hash; rebuild it from its keys with fastconstmap 0.10 or later, which writes the shared format")
 
 // ioChunkWords is how many uint64s WriteTo and ReadFrom move per call to the
 // underlying writer or reader. Moving one word at a time costs a call per
@@ -709,7 +737,16 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 	if _, err := io.ReadFull(tr, buf[:]); err != nil {
 		return 0, fmt.Errorf("constmap: reading magic: %w", err)
 	}
-	if buf != magicBytes {
+	counted := buf == magicBytesCounted
+	if buf != magicBytes && !counted {
+		switch buf {
+		case verifiedMagicBytes:
+			return 0, errors.New("constmap: this is a VerifiedConstMap file, use LoadVerifiedFromFile")
+		case pairedMagicBytes:
+			return 0, errors.New("constmap: this is a PairedVerifiedConstMap file, use LoadPairedFromFile")
+		case legacyFastMagicBytes, legacyFastVerifiedMagicBytes:
+			return 0, errLegacyFastconstmap
+		}
 		return 0, errors.New("constmap: invalid magic bytes")
 	}
 
@@ -739,6 +776,15 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 	}
 	dataLen := binary.LittleEndian.Uint32(buf[:4])
 
+	// Key count, present only in fastconstmap's CMAP0003; not kept.
+	headerSize := 28
+	if counted {
+		if _, err := io.ReadFull(tr, buf[:4]); err != nil {
+			return 0, fmt.Errorf("constmap: reading key count: %w", err)
+		}
+		headerSize = 32
+	}
+
 	// Data, read a chunk at a time and decoded in place.
 	cm.data = make([]uint64, dataLen)
 	if err := readWords(tr, cm.data, chunkBuffer(len(cm.data)), "data"); err != nil {
@@ -755,7 +801,7 @@ func (cm *ConstMap) ReadFrom(r io.Reader) (int64, error) {
 		return 0, fmt.Errorf("constmap: checksum mismatch (got %016x, expected %016x)", gotSum, expectedSum)
 	}
 
-	read := int64(8 + 8 + 4 + 4 + 4 + 8*int(dataLen) + 8)
+	read := int64(headerSize + 8*int(dataLen) + 8)
 	return read, nil
 }
 
@@ -792,7 +838,8 @@ func LoadFromFile(path string) (*ConstMap, error) {
 //   [4] segmentLength
 //   [4] segmentCount
 //   [4] len(data), which is also len(checks)
-//   [4] zero padding
+//   [4] zero padding; fastconstmap stores its original key count here, and
+//       every reader ignores the field
 //   [8*len(data)] data
 //   [8*len(data)] checks
 //   [8] FNV-1a 64-bit checksum of all preceding bytes
@@ -892,8 +939,13 @@ func (vm *VerifiedConstMap) ReadFrom(r io.Reader) (int64, error) {
 		return 0, fmt.Errorf("constmap: reading magic: %w", err)
 	}
 	if buf != verifiedMagicBytes {
-		if buf == magicBytes {
+		switch buf {
+		case magicBytes:
 			return 0, errors.New("constmap: this is a ConstMap file, use LoadFromFile")
+		case pairedMagicBytes:
+			return 0, errors.New("constmap: this is a PairedVerifiedConstMap file, use LoadPairedFromFile")
+		case legacyFastMagicBytes, legacyFastVerifiedMagicBytes:
+			return 0, errLegacyFastconstmap
 		}
 		return 0, errors.New("constmap: invalid magic bytes")
 	}

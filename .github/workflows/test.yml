@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Both architectures with assembly (amd64: SSE2, arm64: NEON), each also
+    # under the purego tag so the portable Go fallbacks stay tested.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go version && go env GOARCH
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go vet -tags purego ./...
+      - run: go test -tags purego ./...
