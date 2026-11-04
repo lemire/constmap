@@ -269,18 +269,19 @@ var cm constmap.ConstMap
 n, err := cm.ReadFrom(r)
 ```
 
-### Interoperability with the Rust and Python implementations
+### Interoperability with the Rust, Python and Java implementations
 
 The formats are shared with [rsconstmap](https://github.com/lemire/rsconstmap)
-(Rust) and [fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python
-bindings): a map saved by any of the three loads in the other two, on a
-little-endian host (which is every mainstream one: x86-64, ARM64, RISC-V, Apple
-silicon). The three share the key hash (XXH64), the mixing, the seed sequence and
-the layout, so for the same input this package and rsconstmap write byte-identical
-files, and fastconstmap writes the same bytes apart from one header word:
+(Rust), [fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python
+bindings) and [jbinfuse](https://github.com/FastFilter/jbinfuse) (Java): a map saved by any of the four loads
+in the other three, on a little-endian host (which is every mainstream one: x86-64,
+ARM64, RISC-V, Apple silicon). The four share the key hash (XXH64), the mixing, the
+seed sequence and the layout, so for the same input this package, rsconstmap and
+jbinfuse write byte-identical files, and fastconstmap writes the same bytes apart
+from one header word:
 
 - `VerifiedConstMap` (`VMAP0001`) and `PairedVerifiedConstMap` (`PMAP0001`) are
-  identical across the three. fastconstmap stores its key count in the header word
+  identical across the four. fastconstmap stores its key count in the header word
   this package leaves as zero padding; every reader ignores the word.
 - `ConstMap` files from fastconstmap carry the magic `CMAP0003`: this package's
   `CMAP0001` plus that 4-byte key count after the data length. `ReadFrom` accepts
@@ -296,16 +297,14 @@ different key hash (XXH3) and cannot be loaded here; `ReadFrom` says so rather t
 reporting an invalid file. fastconstmap 0.10 and later still read them, and a map
 rebuilt from its keys there writes the shared format.
 
-There is also a Java implementation, in [jbinfuse](https://github.com/FastFilter/jbinfuse)
-(`me.lemire.fastfilter:jbinfuse` on Maven Central, version 0.1.0 or later). It shares
-the same formats: for the same input it writes exactly the bytes this package writes
-(its tests check that against this package for sizes up to 1,234,567 keys), it reads
-fastconstmap's `CMAP0003`, and it can also query a saved map in place, from a
-memory-mapped file for example, without copying it.
+jbinfuse (`me.lemire.fastfilter:jbinfuse` on Maven Central, from version 0.1.0) can
+also query a saved map in place, from a memory-mapped file for example, without
+copying it, whichever implementation wrote it.
 
-The interoperability is tested: `testdata/interop/` holds files written by the other
-two implementations from a fixed input, which `interop_test.go` loads and checks, and
-it checks that this package writes exactly the bytes rsconstmap wrote.
+The interoperability is tested: `testdata/interop/` holds files written by rsconstmap
+and fastconstmap from a fixed input, which `interop_test.go` loads and checks, and it
+checks that this package writes exactly the bytes rsconstmap wrote. jbinfuse tests
+itself against these files and against this package, for sizes up to 1,234,567 keys.
 
 ## Running Tests
 
